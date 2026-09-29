@@ -72,7 +72,7 @@ Safety properties:
 ### Shell edition (macOS / Linux / BSD / WSL)
 
 ```sh
-git clone https://github.com/YOUR-USERNAME/opencode-profiles.git  # replace with this repo's URL
+git clone https://github.com/Valentjno/opencode-profiles.git
 cd opencode-profiles
 ./install.sh
 ```
@@ -106,7 +106,7 @@ cp completions/opencode-profiles.bash \
 ### PowerShell edition (Windows / cross-platform)
 
 ```powershell
-git clone https://github.com/YOUR-USERNAME/opencode-profiles.git  # replace with this repo's URL
+git clone https://github.com/Valentjno/opencode-profiles.git
 cd opencode-profiles
 .\install.ps1
 ```
@@ -134,7 +134,7 @@ opencode-profiles.ps1 --help
 ### Python edition (cross-platform)
 
 ```sh
-git clone https://github.com/YOUR-USERNAME/opencode-profiles.git  # replace with this repo's URL
+git clone https://github.com/Valentjno/opencode-profiles.git
 cd opencode-profiles
 python3 install.py
 ```
