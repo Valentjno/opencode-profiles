@@ -1,0 +1,663 @@
+#!/bin/sh
+# opencode-profiles — manage multiple opencode auth profiles.
+#
+# Stores named snapshots of opencode's live credentials file:
+#   $BASE/auth.json             live file opencode reads on startup
+#   $BASE/auth-<name>.json      one snapshot per saved profile
+#   $BASE/current_profile.txt   name of the active profile
+#   $BASE/last_profile.txt      previously active profile (for toggle)
+#
+# BASE defaults to ~/.local/share/opencode and can be overridden with
+# OPENCODE_PROFILE_BASE_DIR (useful for tests and encrypted volumes).
+#
+# Clean-room implementation for the opencode-profiles project (MIT).
+# Behavioural inspirations are credited in CITATIONS.md; no lines are
+# copied from those works.
+#
+# Usage:
+#   opencode-profiles                        interactive menu
+#   opencode-profiles list                   list profiles
+#   opencode-profiles current                print active profile
+#   opencode-profiles switch <name>          activate a saved profile
+#   opencode-profiles save <name>            snapshot auth.json as <name>
+#   opencode-profiles delete <name> [--yes]  remove a saved profile
+#   opencode-profiles toggle [a] [b]         flip between profiles
+#   opencode-profiles -h | --help            this text
+#   opencode-profiles -V | --version         print version
+
+VERSION='1.0.0'
+
+# --- tiny output helpers -------------------------------------------------
+
+fail() {
+    printf 'Error: %s\n' "$1" >&2
+    exit 1
+}
+
+say() {
+    printf '%s\n' "$1"
+}
+
+warn() {
+    printf 'Warning: %s\n' "$1" >&2
+}
+
+# --- locations -----------------------------------------------------------
+
+resolve_paths() {
+    if [ -n "${OPENCODE_PROFILE_BASE_DIR:-}" ]; then
+        OCP_BASE=$OPENCODE_PROFILE_BASE_DIR
+    else
+        OCP_BASE="$HOME/.local/share/opencode"
+    fi
+    OCP_LIVE="$OCP_BASE/auth.json"
+    OCP_TRACK="$OCP_BASE/current_profile.txt"
+    OCP_PREV="$OCP_BASE/last_profile.txt"
+    OCP_NAMES=''
+    OCP_COUNT=0
+    OCP_RECORDED=''
+    OCP_ACTIVE=''
+    OCP_STATE=''
+}
+
+make_base() {
+    if [ ! -d "$OCP_BASE" ]; then
+        mkdir -p "$OCP_BASE" || fail "cannot create directory '$OCP_BASE'"
+    fi
+}
+
+profile_file() {
+    # $1 = profile name -> prints "$OCP_BASE/auth-<name>.json"
+    printf '%s/auth-%s.json' "$OCP_BASE" "$1"
+}
+
+# --- scanning ------------------------------------------------------------
+
+scan_profiles() {
+    OCP_NAMES=''
+    OCP_COUNT=0
+    _p_path=
+    _p_base=
+    _p_name=
+    for _p_path in "$OCP_BASE"/auth-*.json; do
+        [ -f "$_p_path" ] || continue
+        _p_base=$(basename "$_p_path")
+        _p_name=${_p_base#auth-}
+        _p_name=${_p_name%.json}
+        [ -n "$_p_name" ] || continue
+        case $_p_name in
+            *'/'*|*'\\'*) continue ;;
+        esac
+        if [ -z "$OCP_NAMES" ]; then
+            OCP_NAMES=$_p_name
+        else
+            OCP_NAMES=$(printf '%s\n%s' "$OCP_NAMES" "$_p_name")
+        fi
+    done
+    if [ -n "$OCP_NAMES" ]; then
+        OCP_NAMES=$(printf '%s\n' "$OCP_NAMES" | sort -u)
+        OCP_COUNT=$(printf '%s\n' "$OCP_NAMES" | wc -l | tr -d ' ')
+    fi
+}
+
+has_profile() {
+    # $1 = name -> 0 if a snapshot exists
+    [ -f "$(profile_file "$1")" ]
+}
+
+# --- current / previous state --------------------------------------------
+
+read_first_line() {
+    # $1 = file -> prints first line without trailing CR, or nothing
+    IFS= read -r _first < "$1" 2>/dev/null || return 0
+    _first=$(printf '%s' "$_first" | tr -d '\r')
+    # trim surrounding whitespace
+    _first=$(printf '%s' "$_first" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    printf '%s' "$_first"
+}
+
+refresh_state() {
+    OCP_RECORDED=''
+    OCP_ACTIVE=''
+    OCP_STATE=''
+    if [ -f "$OCP_TRACK" ]; then
+        OCP_RECORDED=$(read_first_line "$OCP_TRACK")
+        if [ -n "$OCP_RECORDED" ] && has_profile "$OCP_RECORDED"; then
+            OCP_ACTIVE=$OCP_RECORDED
+            OCP_STATE=$OCP_RECORDED
+        elif [ -n "$OCP_RECORDED" ]; then
+            OCP_STATE="$OCP_RECORDED (profile file missing)"
+        else
+            OCP_STATE='unset (empty tracking file)'
+        fi
+    elif [ -f "$OCP_LIVE" ]; then
+        OCP_STATE='unknown (auth.json exists but is not linked to a saved profile)'
+    else
+        OCP_STATE='unset (no auth.json)'
+    fi
+    OCP_PREV_NAME=''
+    if [ -f "$OCP_PREV" ]; then
+        OCP_PREV_NAME=$(read_first_line "$OCP_PREV")
+    fi
+}
+
+# --- validation ----------------------------------------------------------
+
+name_ok() {
+    # $1 = candidate -> 0 when acceptable
+    case $1 in
+        '') say 'Profile name cannot be empty.'; return 1 ;;
+        *[!A-Za-z0-9_-]*)
+            say 'Profile name may only contain letters, numbers, underscores, and hyphens.'
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+ask_yes_no() {
+    # $1 = prompt -> 0 only on y/yes
+    printf '%s [y/N]: ' "$1"
+    IFS= read -r _ans || return 1
+    case $_ans in
+        y|Y|yes|YES|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+opencode_busy() {
+    # best effort; never fails
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -x opencode >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+# --- state writers -------------------------------------------------------
+
+note_current() {
+    # $1 = name -> remember as active
+    printf '%s\n' "$1" > "$OCP_TRACK" || fail 'cannot update current_profile.txt'
+}
+
+note_previous() {
+    # $1 = name -> remember as most-recently-used
+    printf '%s\n' "$1" > "$OCP_PREV" || fail 'cannot update last_profile.txt'
+}
+
+# --- core actions --------------------------------------------------------
+
+activate() {
+    # $1 = profile name
+    _src=$(profile_file "$1")
+    [ -f "$_src" ] || fail "profile not found: '$1' (see 'list')"
+    if opencode_busy; then
+        warn 'opencode seems to be running; quit it first, then switch, then reopen it.'
+    fi
+    if [ -n "$OCP_ACTIVE" ] && [ "$OCP_ACTIVE" != "$1" ]; then
+        note_previous "$OCP_ACTIVE"
+    fi
+    cp "$_src" "$OCP_LIVE" || fail 'cannot copy profile over auth.json'
+    note_current "$1"
+    OCP_ACTIVE=$1
+    OCP_STATE=$1
+    say "Switched to profile '$1'."
+}
+
+snapshot() {
+    # $1 = profile name
+    [ -f "$OCP_LIVE" ] || fail "no auth.json at '$OCP_LIVE'; log in via opencode first"
+    _dst=$(profile_file "$1")
+    cp "$OCP_LIVE" "$_dst" || fail "cannot save profile '$1'"
+    if [ -n "$OCP_ACTIVE" ] && [ "$OCP_ACTIVE" != "$1" ]; then
+        note_previous "$OCP_ACTIVE"
+    fi
+    note_current "$1"
+    OCP_ACTIVE=$1
+    OCP_STATE=$1
+    say "Saved current auth.json to profile '$1'."
+}
+
+remove_profile() {
+    # $1 = name, $2 = --yes when skipping the prompt
+    _dst=$(profile_file "$1")
+    [ -f "$_dst" ] || fail "profile not found: '$1' (see 'list')"
+    if [ "${2:-}" != '--yes' ] && [ "${2:-}" != '-y' ] && [ "${2:-}" != '--force' ]; then
+        ask_yes_no "Delete profile '$1'?" || { say 'Aborted.'; return 0; }
+    fi
+    rm -f "$_dst" || fail "cannot delete profile '$1'"
+    if [ "$OCP_ACTIVE" = "$1" ]; then
+        # active snapshot is gone; keep live auth.json, drop the pointer
+        rm -f "$OCP_TRACK" || fail 'cannot update current_profile.txt'
+        OCP_ACTIVE=''
+        OCP_STATE='unset (active profile was deleted; auth.json left in place)'
+    fi
+    say "Deleted profile '$1'."
+}
+
+show_list() {
+    scan_profiles
+    refresh_state
+    say "Current profile: $OCP_STATE"
+    say ''
+    if [ "$OCP_COUNT" -eq 0 ]; then
+        say "No saved profiles in $OCP_BASE"
+        say "Tip: 'save <name>' snapshots the current auth.json."
+        return 0
+    fi
+    say 'Available profiles:'
+    printf '%s\n' "$OCP_NAMES" | while IFS= read -r _n; do
+        if [ "$_n" = "$OCP_ACTIVE" ]; then
+            printf '  * %s  (active)\n' "$_n"
+        else
+            printf '    %s\n' "$_n"
+        fi
+    done
+}
+
+show_current() {
+    refresh_state
+    say "$OCP_STATE"
+}
+
+other_than() {
+    # $1 = name to skip -> prints first remaining profile, or nothing
+    printf '%s\n' "$OCP_NAMES" | while IFS= read -r _n; do
+        if [ "$_n" != "$1" ]; then
+            printf '%s\n' "$_n"
+            break
+        fi
+    done
+}
+
+nth_profile() {
+    # $1 = 1-based index -> prints that profile name
+    printf '%s\n' "$OCP_NAMES" | sed -n "${1}p"
+}
+
+next_cyclic() {
+    # prints the profile after $OCP_ACTIVE in sorted order (wraps)
+    _i=1
+    _found=0
+    while [ "$_i" -le "$OCP_COUNT" ]; do
+        if [ "$(nth_profile "$_i")" = "$OCP_ACTIVE" ]; then
+            _found=$_i
+            break
+        fi
+        _i=$((_i + 1))
+    done
+    if [ "$_found" -eq 0 ]; then
+        nth_profile 1
+    elif [ "$_found" -ge "$OCP_COUNT" ]; then
+        nth_profile 1
+    else
+        nth_profile $((_found + 1))
+    fi
+}
+
+do_toggle() {
+    # [a] [b] — explicit pair wins; otherwise 2-profile flip or MRU cycling
+    _a=${1:-}
+    _b=${2:-}
+    if [ -n "$_a" ]; then
+        name_ok "$_a" || exit 1
+    fi
+    if [ -n "$_b" ]; then
+        name_ok "$_b" || exit 1
+    fi
+    scan_profiles
+    refresh_state
+    if [ -n "$_a" ] && [ -n "$_b" ]; then
+        [ "$_a" != "$_b" ] || fail 'toggle needs two different profile names'
+        has_profile "$_a" || fail "profile not found: '$_a' (see 'list')"
+        has_profile "$_b" || fail "profile not found: '$_b' (see 'list')"
+        if [ "$OCP_ACTIVE" = "$_a" ]; then
+            activate "$_b"
+        else
+            # covers active==b and unknown states: land on the first of the pair
+            if [ "$OCP_ACTIVE" = "$_b" ]; then
+                activate "$_a"
+            else
+                say "Current profile is '$OCP_STATE'; selecting '$_a'."
+                activate "$_a"
+            fi
+        fi
+        return 0
+    fi
+    if [ -n "$_a" ]; then
+        # single-name toggle: flip between current and <a>
+        has_profile "$_a" || fail "profile not found: '$_a' (see 'list')"
+        if [ "$OCP_ACTIVE" = "$_a" ]; then
+            _fall=
+            if [ -n "$OCP_PREV_NAME" ] && [ "$OCP_PREV_NAME" != "$_a" ] \
+                && has_profile "$OCP_PREV_NAME"; then
+                _fall=$OCP_PREV_NAME
+            elif [ "$OCP_COUNT" -ge 2 ]; then
+                _fall=$(other_than "$_a")
+            fi
+            [ -n "$_fall" ] || fail "only one profile exists; nothing to toggle to"
+            activate "$_fall"
+        else
+            activate "$_a"
+        fi
+        return 0
+    fi
+    # bare toggle
+    [ "$OCP_COUNT" -gt 0 ] || fail 'no saved profiles (see: save <name>)'
+    if [ "$OCP_COUNT" -eq 1 ]; then
+        say "Already on profile '$(nth_profile 1)'. Nothing to do."
+        return 0
+    fi
+    if [ "$OCP_COUNT" -eq 2 ]; then
+        _dest=$(other_than "$OCP_ACTIVE")
+        [ -n "$_dest" ] || fail "unrecognized active profile '$OCP_STATE'"
+        activate "$_dest"
+        return 0
+    fi
+    if [ -n "$OCP_PREV_NAME" ] && [ "$OCP_PREV_NAME" != "$OCP_ACTIVE" ] \
+        && has_profile "$OCP_PREV_NAME"; then
+        activate "$OCP_PREV_NAME"
+        return 0
+    fi
+    _dest=$(next_cyclic)
+    [ -n "$_dest" ] || fail "unrecognized active profile '$OCP_STATE'"
+    activate "$_dest"
+}
+
+# --- CLI subcommands -----------------------------------------------------
+
+cmd_switch() {
+    [ -n "${1:-}" ] || fail "usage: $0 switch <profile_name>"
+    name_ok "$1" || exit 1
+    scan_profiles
+    refresh_state
+    if [ -n "$OCP_ACTIVE" ] && [ "$OCP_ACTIVE" = "$1" ]; then
+        say "Already on profile '$1'. Nothing to do."
+        return 0
+    fi
+    activate "$1"
+}
+
+cmd_save() {
+    [ -n "${1:-}" ] || fail "usage: $0 save <profile_name>"
+    name_ok "$1" || exit 1
+    scan_profiles
+    refresh_state
+    if has_profile "$1"; then
+        ask_yes_no "Profile '$1' already exists. Overwrite?" \
+            || { say 'Aborted.'; return 0; }
+    fi
+    snapshot "$1"
+}
+
+cmd_delete() {
+    [ -n "${1:-}" ] || fail "usage: $0 delete <profile_name> [--yes]"
+    name_ok "$1" || exit 1
+    scan_profiles
+    refresh_state
+    remove_profile "$1" "${2:-}"
+}
+
+# --- help / version ------------------------------------------------------
+
+print_help() {
+    cat <<EOF
+opencode-profiles $VERSION - manage multiple opencode auth profiles
+
+USAGE
+    $0 [COMMAND] [ARGS]
+    (no arguments)         interactive menu
+
+COMMANDS
+    list                   list saved profiles, marking the active one
+    current                print the active profile name (or status)
+    switch <name>          activate a saved profile (copies it to auth.json)
+    save <name>            snapshot the current auth.json as <name>
+    delete <name> [--yes]  remove a saved profile (asks first unless --yes)
+    toggle [a] [b]         flip between profiles:
+                             toggle a b  flip between a and b
+                             toggle a    flip between current and a
+                             toggle      2 profiles: flip to the other;
+                                         3+: jump to most-recently-used,
+                                         else next in sorted order
+    -i                     force the interactive menu
+    -h, --help             show this help
+    -V, --version          print the version
+
+HOW IT WORKS
+    Profiles are snapshots stored next to the live file opencode reads:
+
+        \$BASE/auth.json            live credentials (opencode reads this)
+        \$BASE/auth-<name>.json     one snapshot per profile
+        \$BASE/current_profile.txt  active profile name
+        \$BASE/last_profile.txt     previously active profile (toggle memory)
+
+    BASE is ~/.local/share/opencode unless OPENCODE_PROFILE_BASE_DIR is set.
+    Always quit opencode before switching, then reopen it afterwards.
+
+EXAMPLES
+    $0 save work
+    $0 save personal
+    $0 switch personal
+    $0 toggle work personal
+    $0 toggle
+    $0 list
+
+COMPATIBILITY
+    Installed under the legacy names, this same file answers to:
+      opencode-switch  -> toggle-oriented alias (bare run toggles)
+      oc-profiles      -> 1:1 alias (deprecated name)
+      oc-profile       -> 1:1 alias (deprecated name)
+
+SECURITY
+    Profile files hold the same secrets as auth.json. They never leave
+    your machine (no network use); consider 'chmod 700 \$BASE' and
+    'chmod 600 \$BASE/auth-*.json'. This repo's .gitignore excludes them
+    so they are never committed by accident.
+EOF
+}
+
+# --- interactive menu ----------------------------------------------------
+
+numbered() {
+    # prints profiles as "N) name [(active)]"
+    _k=1
+    printf '%s\n' "$OCP_NAMES" | while IFS= read -r _n; do
+        if [ "$_n" = "$OCP_ACTIVE" ]; then
+            printf '%s) %s  (active)\n' "$_k" "$_n"
+        else
+            printf '%s) %s\n' "$_k" "$_n"
+        fi
+        _k=$((_k + 1))
+    done
+}
+
+menu_pick() {
+    scan_profiles
+    refresh_state
+    if [ "$OCP_COUNT" -eq 0 ]; then
+        say 'No saved profiles yet; use "save" first.'
+        return 1
+    fi
+    numbered
+    while :; do
+        printf 'Select a profile [1-%s, q]: ' "$OCP_COUNT"
+        IFS= read -r _sel || return 1
+        case $_sel in
+            q|quit) return 1 ;;
+            ''|*[!0-9]*)
+                say 'Enter a number, or q.'
+                ;;
+            *)
+                if [ "$_sel" -lt 1 ] || [ "$_sel" -gt "$OCP_COUNT" ]; then
+                    say "Enter a number from 1 to $OCP_COUNT."
+                else
+                    activate "$(nth_profile "$_sel")"
+                    return 0
+                fi
+                ;;
+        esac
+    done
+}
+
+menu_save() {
+    if [ ! -f "$OCP_LIVE" ]; then
+        say 'No auth.json found. Nothing to save.'
+        return 1
+    fi
+    scan_profiles
+    refresh_state
+    while :; do
+        if [ -n "$OCP_ACTIVE" ]; then
+            printf 'Profile name [%s]: ' "$OCP_ACTIVE"
+        else
+            printf 'Profile name: '
+        fi
+        IFS= read -r _nm || return 1
+        case $_nm in
+            q|quit) return 1 ;;
+        esac
+        if [ -z "$_nm" ] && [ -n "$OCP_ACTIVE" ]; then
+            _nm=$OCP_ACTIVE
+        fi
+        name_ok "$_nm" || continue
+        if has_profile "$_nm"; then
+            printf "Profile '%s' already exists. Overwrite? [y/N]: " "$_nm"
+            IFS= read -r _ow || return 1
+            case $_ow in
+                y|Y|yes|YES|Yes) ;;
+                q|quit) return 1 ;;
+                *) continue ;;
+            esac
+        fi
+        snapshot "$_nm"
+        return 0
+    done
+}
+
+menu_delete() {
+    scan_profiles
+    refresh_state
+    if [ "$OCP_COUNT" -eq 0 ]; then
+        say 'No saved profiles yet; nothing to delete.'
+        return 1
+    fi
+    numbered
+    while :; do
+        printf 'Delete which profile [1-%s, q]: ' "$OCP_COUNT"
+        IFS= read -r _sel || return 1
+        case $_sel in
+            q|quit) return 1 ;;
+            ''|*[!0-9]*)
+                say 'Enter a number, or q.'
+                ;;
+            *)
+                if [ "$_sel" -lt 1 ] || [ "$_sel" -gt "$OCP_COUNT" ]; then
+                    say "Enter a number from 1 to $OCP_COUNT."
+                else
+                    remove_profile "$(nth_profile "$_sel")"
+                    return 0
+                fi
+                ;;
+        esac
+    done
+}
+
+menu_main() {
+    while :; do
+        scan_profiles
+        refresh_state
+        say ''
+        say '=== opencode-profiles ==='
+        say "Base directory : $OCP_BASE"
+        say "Current profile: $OCP_STATE"
+        say ''
+        say '1) Switch to a profile'
+        say '2) Save current auth.json as a profile'
+        say '3) Toggle between profiles'
+        say '4) List all profiles'
+        say '5) Delete a profile'
+        say 'q) Quit'
+        say ''
+        printf 'Choose an action [1-5, q]: '
+        IFS= read -r _act || _act=q
+        say ''
+        case $_act in
+            1) menu_pick || : ;;
+            2) menu_save || : ;;
+            3) do_toggle || say 'Toggle failed (see message above).' ;;
+            4) show_list ;;
+            5) menu_delete || : ;;
+            q|quit) say 'Goodbye.'; exit 0 ;;
+            *) say 'Invalid choice. Enter 1-5 or q.' ;;
+        esac
+    done
+}
+
+# --- legacy argv[0] handling ---------------------------------------------
+
+compat_note() {
+    # $1 = legacy name
+    warn "'$1' is a compatibility alias; prefer 'opencode-profiles' (see --help)."
+}
+
+# --- entry point ---------------------------------------------------------
+
+main() {
+    resolve_paths
+    make_base
+
+    _prog=$(basename "$0")
+    _cmd=${1:-}
+    _arg2=${2:-}
+    _arg3=${3:-}
+
+    case $_prog in
+        opencode-switch*)
+            case $_cmd in
+                ''|toggle)
+                    compat_note "$_prog"
+                    shift 2>/dev/null || true
+                    do_toggle "$@"
+                    return 0
+                    ;;
+                current|-h|--help|-V|--version|list|switch|save|delete|-i)
+                    compat_note "$_prog"
+                    ;;
+                work|personal)
+                    # historical fixed pair: keep working as plain switch
+                    compat_note "$_prog"
+                    cmd_switch "$_cmd"
+                    return 0
+                    ;;
+                *)
+                    if [ $# -eq 0 ]; then
+                        compat_note "$_prog"
+                        do_toggle
+                        return 0
+                    fi
+                    compat_note "$_prog"
+                    ;;
+            esac
+            ;;
+        oc-profiles|oc-profiles.sh|oc-profile|oc-profile.sh)
+            compat_note "$_prog"
+            ;;
+    esac
+
+    case $_cmd in
+        '') menu_main ;;
+        -i) menu_main ;;
+        list) show_list ;;
+        current) show_current ;;
+        switch) cmd_switch "$_arg2" ;;
+        save) cmd_save "$_arg2" ;;
+        delete|rm|remove) cmd_delete "$_arg2" "$_arg3" ;;
+        toggle) do_toggle "$_arg2" "$_arg3" ;;
+        -h|--help|help) print_help ;;
+        -V|--version|version) say "opencode-profiles $VERSION" ;;
+        *) fail "unknown command '$_cmd' (see --help)" ;;
+    esac
+}
+
+main "$@"

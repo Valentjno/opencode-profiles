@@ -1,0 +1,13 @@
+# Local auth snapshots — NEVER commit credentials.
+auth-*.json
+auth.json
+current_profile.txt
+last_profile.txt
+
+# Test / dev artefacts
+tests/tmp/
+*.tmp
+*.bak
+__pycache__/
+*.pyc
+.DS_Store
